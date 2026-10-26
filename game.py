@@ -5,9 +5,18 @@ AI 调用本地训练好的模型权重（log/flipzero/ 下最新的 .tar）进�
 
 运行：
     python game.py
+    python game.py --online   # 联机模式：自动连接 flip-game-server 对弈
+
 """
-import os
 import sys
+
+# 联机模式在导入 pygame 之前分流，避免无界面环境下加载图形库
+if __name__ == "__main__" and "--online" in sys.argv:
+    from online import main as online_main
+    online_main(sys.argv[1:])
+    sys.exit(0)
+
+import os
 import glob
 import time
 

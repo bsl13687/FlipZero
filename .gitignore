@@ -5,10 +5,7 @@ __pycache__/
 build/
 dist/
 
-# Training artifacts
-log/
-*.tar
-
+run-online.bat
 # Environments
 .env
 .venv/

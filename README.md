@@ -7,23 +7,32 @@ FlipZero is a Deep Monte Carlo (DMC) reinforcement-learning trainer for Chinese 
 
 Install / develop:
 ```bash
+conda create -n python39 python=3.9
 pip install -r requirements.txt
 pip install -e .          # registers the `flipzero` package
 ```
 
 Train (writes checkpoints to `log/<xpid>/model_step_<N>.tar`):
 ```bash
+conda activate python39
 python train.py --xpid flipzero --num_actors 12 --training_device cuda:0 --load_model 2>&1 | tee train_<xpid>_log.txt
 ```
 
 Evaluate a trained model against a random opponent:
 ```bash
+conda activate python39
 python evaluate.py --model_path log/flipzero/model_step_<N>.tar --num_games 1000
 ```
 
 Run the GUI (human vs. human, human vs. AI, or AI vs. AI; loads the latest `.tar` under `log/flipzero/` automatically):
 ```bash
+conda activate python39
 python game.py
+
+# Monte Carlo Search
+python gamev2.py --mode gui
+# or
+python gamev2.py --mode gui --leaf-steps 12 --early-plies 10 --early-rollouts 500
 ```
 
 
