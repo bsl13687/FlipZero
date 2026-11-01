@@ -56,7 +56,8 @@ def train(flags):
                 f"effective_batch=T*B={flags.unroll_length}*{flags.batch_size}={flags.unroll_length*flags.batch_size}")
 
     actor_models = []
-    if flags.actor_device_cpu:
+    if flags.actor_device_cpu or not torch.cuda.is_available():
+        # 默认走 GPU；无 CUDA 时回退到 CPU，保证纯 CPU 训练仍可运行。
         actor_device = torch.device('cpu')
     else:
         actor_device = torch.device(f'cuda:{flags.gpu_device}')
@@ -69,8 +70,11 @@ def train(flags):
     flags._actor_models = [m.get_model() for m in actor_models]
     logger.info(f"Actor device: {actor_device} | {flags.num_actors} actor models created")
 
-    episode_count = ctx.Value('i', 0)
-    training_steps = ctx.Value('i', 0)
+    # 计数器必须用 64 位（'q'）：训练步数会超过 2^31（约 21.47 亿），
+    # 用 'i'（32 位有符号）会在第 21.47 亿步回绕成负数，导致进度倒退、FPS 为负、
+    # 保存条件失效，且 epsilon 退火按负数计算。episode_count 同理用 64 位。
+    episode_count = ctx.Value('q', 0)
+    training_steps = ctx.Value('q', 0)
     loss_sum = ctx.Value('d', 0.0)
     loss_count = ctx.Value('i', 0)
     grad_norm_sum = ctx.Value('d', 0.0)

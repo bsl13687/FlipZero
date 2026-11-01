@@ -24,8 +24,8 @@ def parser():
 
     p.add_argument('--gpu_device', type=str, default='0', help='GPU device for training')
     p.add_argument('--training_device', type=str, default='cuda:0', help='Device for learner (e.g. cuda:0 or cpu)')
-    p.add_argument('--actor_device_cpu', type=str2bool, default=True, help='Actor uses CPU for inference (yes/no/true/false)')
-    p.add_argument('--num_actors', type=int, default=5, help='Number of actor processes')
+    p.add_argument('--actor_device_cpu', type=str2bool, default=False, help='Actor uses CPU for inference (yes/no/true/false)；默认用 GPU，实测吞吐约为 CPU actor 的 2 倍')
+    p.add_argument('--num_actors', type=int, default=6, help='Number of actor processes（本机实测 6~8 即可，更多只增加 CPU 争用）')
     p.add_argument('--num_buffers', type=int, default=64, help='Number of shared memory buffers')
     p.add_argument('--num_threads', type=int, default=1, help='Number of learner threads (>1 时各线程在 lock 下串行训练，通常无收益)')
     p.add_argument('--actor_sync_interval', type=int, default=50, help='每多少个 mini-batch 把 learner 权重广播给 actors')

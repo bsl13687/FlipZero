@@ -165,11 +165,14 @@ def _select_action(model, infoset, exp_epsilon, device):
 
     n = len(legal_actions)
     x_no_action = torch.from_numpy(infoset.x_no_action).to(device).unsqueeze(0).expand(n, -1).contiguous()
-    z = torch.from_numpy(infoset.z).to(device).unsqueeze(0).expand(n, -1, -1).contiguous()
     actions = torch.from_numpy(action_encodings).to(device)
+    z = torch.from_numpy(infoset.z).to(device)  # [HISTORY_LENGTH, Z_DIM]
 
+    net = model.get_model()
     with torch.no_grad():
-        values = model.get_model()(x_no_action, actions, z, return_value=True)['value']  # [N]
+        # 同一次决策的所有合法动作共享同一条历史，LSTM 只算一次（原先算了 N 遍）。
+        lstm_last = net.encode_history(z).expand(n, -1)
+        values = net.value_from_lstm(lstm_last, x_no_action, actions)  # [N]
     best_idx = int(torch.argmax(values).item())
     return legal_actions[best_idx], action_encodings[best_idx]
 

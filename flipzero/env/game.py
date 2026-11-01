@@ -148,6 +148,9 @@ def _is_valid_cannon_attack(board, fr, fc, tr, tc):
 
 
 class GameEnv:
+    # 类级默认值：online.py 等通过 GameEnv.__new__ 手工构造实例时也能安全访问。
+    _legal_actions_cache = None
+
     def __init__(self):
         self.board = None
         self.true_board = None
@@ -172,6 +175,7 @@ class GameEnv:
         self.peace_steps = 0
         self.done = False
         self.winner = -1
+        self._legal_actions_cache = None
 
         idx = 0
         flipped_set = set(FLIPPED_POSITIONS)
@@ -253,6 +257,7 @@ class GameEnv:
             self.peace_steps += 1
 
         self.current_player = 1 - self.current_player
+        self._legal_actions_cache = None
         self._check_winner()
         reward = self._get_reward()
         return self._get_obs(), reward, self.done
@@ -277,7 +282,11 @@ class GameEnv:
 
     def _has_legal_actions(self, player):
         from flipzero.env.move_generator import MoveGenerator
-        return len(MoveGenerator.get_legal_actions(self.board, player, self.unflipped_positions)) > 0
+        actions = MoveGenerator.get_legal_actions(self.board, player, self.unflipped_positions)
+        if player == self.current_player:
+            # 紧接着 InfoSet 需要同一玩家、同一局面的合法动作，缓存起来避免重复计算。
+            self._legal_actions_cache = actions
+        return len(actions) > 0
 
     def _get_reward(self):
         if not self.done:
@@ -289,8 +298,11 @@ class GameEnv:
         return -1
 
     def get_legal_actions(self):
-        from flipzero.env.move_generator import MoveGenerator
-        return MoveGenerator.get_legal_actions(self.board, self.current_player, self.unflipped_positions)
+        if self._legal_actions_cache is None:
+            from flipzero.env.move_generator import MoveGenerator
+            self._legal_actions_cache = MoveGenerator.get_legal_actions(
+                self.board, self.current_player, self.unflipped_positions)
+        return self._legal_actions_cache
 
     def deepcopy(self):
         new_env = GameEnv.__new__(GameEnv)
@@ -303,4 +315,5 @@ class GameEnv:
         new_env.unflipped_positions = set(self.unflipped_positions)
         new_env.done = self.done
         new_env.winner = self.winner
+        new_env._legal_actions_cache = None
         return new_env

@@ -24,6 +24,24 @@ class FlipZeroModel(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         self.mlp = nn.Sequential(*layers)
 
+    def encode_history(self, z):
+        """把历史动作序列编码成 LSTM 最后一步的隐状态，返回 [B, LSTM_HIDDEN]。
+
+        z 可为 [HISTORY_LENGTH, Z_DIM]（单条历史）或 [B, HISTORY_LENGTH, Z_DIM]。
+        决策时一次评估的 N 个合法动作共享同一条历史，因此只需调用一次。
+        """
+        if z.dim() == 2:
+            z = z.unsqueeze(0)
+        lstm_out, _ = self.lstm(z)
+        return lstm_out[:, -1, :]
+
+    def value_from_lstm(self, lstm_last, x_no_action, action):
+        """在已算好的历史隐状态上，对 N 个候选动作批量打分。"""
+        x = torch.cat([lstm_last,
+                       x_no_action.reshape(lstm_last.shape[0], -1),
+                       action.reshape(lstm_last.shape[0], -1)], dim=1)
+        return self.mlp(x).squeeze(-1)
+
     def forward(self, x_no_action, action, z, return_value=True):
         if z.dim() == 4:
             B, T, H, F = z.shape
@@ -33,15 +51,12 @@ class FlipZeroModel(nn.Module):
         else:
             z = z.reshape(z.shape[0], HISTORY_LENGTH, Z_DIM)
 
-        lstm_out, _ = self.lstm(z)
-        lstm_last = lstm_out[:, -1, :]
+        lstm_last = self.encode_history(z)
 
         if lstm_last.shape[0] != x_no_action.shape[0] and x_no_action.dim() == 3:
             lstm_last = lstm_last.reshape(x_no_action.shape[0], -1)
 
-        x = torch.cat([lstm_last, x_no_action.reshape(lstm_last.shape[0], -1),
-                        action.reshape(lstm_last.shape[0], -1)], dim=1)
-        value = self.mlp(x).squeeze(-1)
+        value = self.value_from_lstm(lstm_last, x_no_action, action)
         if return_value:
             return dict(value=value)
         return value
