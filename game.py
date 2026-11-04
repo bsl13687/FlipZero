@@ -210,6 +210,12 @@ class GuiDeepAgent:
         with torch.no_grad():
             values = self.model(x_no_action, actions, z, return_value=True)["value"]
         best_idx = int(torch.argmax(values).item())
+        # print("legal_actions:")
+        # print(legal_actions)
+        # print("values:")
+        # print(values)
+        # print("best_index:")
+        # print(best_idx)
         return legal_actions[best_idx]
 
 

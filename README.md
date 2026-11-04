@@ -17,13 +17,21 @@ pip install -e .          # registers the `flipzero` package
 Train (writes checkpoints to `log/<xpid>/model_step_<N>.tar`):
 ```bash
 conda activate python39
-python train.py --xpid flipzero --num_actors 12 --training_device cuda:0 --load_model 2>&1 | tee train_<xpid>_log.txt
+
+# actor use cpu,
+python train.py --xpid flipzero --num_actors 12 --training_device cuda:0 --load_model --actor_device_cpu true 2>&1 | tee train_<xpid>_log.txt
+
+# actor use gpu,RTX 4060 fps 1950
+python train.py --xpid flipzero --num_actors 6 --training_device cuda:0 --load_model --actor_device_cpu false 2>&1 | tee train_<xpid>_log.txt
 ```
 
 Evaluate a trained model against a random opponent:
 ```bash
 conda activate python39
+
+
 python evaluate.py --model_path log/flipzero/model_step_<N>.tar --num_games 1000
+
 ```
 
 Run the GUI (human vs. human, human vs. AI, or AI vs. AI; loads the latest `.tar` under `log/flipzero/` automatically):
@@ -32,9 +40,9 @@ conda activate python39
 python game.py
 
 # Monte Carlo Search
-python gamev2.py --mode gui
+python gamev2.py --mode gui --no-trace-rollouts
 # or
-python gamev2.py --mode gui --leaf-steps 12 --early-plies 10 --early-rollouts 500
+python gamev2.py --mode gui --leaf-steps 12 --early-plies 10 --early-rollouts 500 --no-trace-rollouts
 ```
 
 
