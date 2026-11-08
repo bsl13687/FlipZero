@@ -9,6 +9,7 @@ AI 调用本地训练好的模型权重（log/flipzero/ 下最新的 .tar）进�
 import os
 import sys
 import glob
+import math
 import time
 import pickle
 import threading
@@ -105,17 +106,88 @@ MODEL_SLOTS = [
 ]
 
 # ---------------- MCTS 配置 ----------------
-# 多进程 rollout 模拟：从根局面按神经网络预测权重采样若干次，
-# 统计每个根动作的 win/visit，最后选胜率最高的动作。
+# 多进程 rollout 模拟：每个 worker 在 think_time 秒内反复"采样一个世界 + 模拟到终局"，
+# 统计每个根动作的 visit / win / draw，最后由 act() 汇总并选出要走的一步。
 MCTS_NUM_WORKERS = 6          # 并行模拟进程数（按需调整）
 MCTS_THINK_TIME = 10.0        # 每次走棋思考时间（秒）
-MCTS_ROLLOUT_TEMPERATURE = 1.0  # rollout 中 softmax 温度，越大越随机
-MCTS_ROOT_TEMPERATURE = 1.0     # 根动作采样温度
-MCTS_ROOT_BOOST = 4.0           # 模型推荐动作的权重放大系数（1.0=不放大；2.0=最看好动作权重×2后再归一化，例如0.6/0.4→0.75/0.25）
+
+# ---- 搜索形态 ----
+# 'tree' : 树式 MCTS——每个 worker 在自己的采样世界里建一棵树，
+#          用 PUCT 选择、展开时对全部合法动作做一次批量前向、用网络估值代替 playout。
+#          重访同一局面时复用已有统计，不再"每次从根重新模拟"，因此每单位算力
+#          产生的备份次数约为 rollout 版的 8~9 倍（一次前向 = 一次备份，
+#          而不是 8 步 rollout 才产生一次备份）。
+# 'flat' : **当前默认**——根动作上做扁平 UCB1 + 截断 rollout（PIMC）。
+#          论文 §5.8.1 的 86.0% 就是它。
+#
+# 为什么默认不是树式：2026-11 实测（同一 20 局、2s/步、同一贪心对手）
+#   扁平 UCB+rollout            18/20 = 90%
+#   树式（节点值=max V，无 playout）   4/20 = 20%   <- 最大化偏差把 Q 全顶到 0.97+
+#   树式（3 层 + 8 步 playout）      12/20 = 60%   <- 单世界的重复 playout 无信息增益
+#   树式（每次 playout 重采样世界）     11/20 = 55%   <- 预算被 PUCT 的尖先验吸走，
+#                                                    退化成"跟着网络 argmax 走"
+# 结论：树本身没带来增益，瓶颈在**估值质量**（同一个网络、同一套贪心尾巴）与
+# **探索广度**（扁平 UCB 会给 top-5 每个约 170 次公平采样，PUCT 则把预算喂给先验）。
+# 要让树真正赢，需要：批量叶子评估 + 跨步复用 + 虚拟损失并行 + 均匀化先验，
+# 而不是简单把 rollout 换成树。
+MCTS_SEARCH = 'flat'
+MCTS_TREE_C_PUCT = 1.0        # PUCT 探索系数
+MCTS_TREE_PRIOR_TEMP = 0.25   # 先验温度，单位是"动作价值极差"（越小越信任网络，越大越平均）
+MCTS_TREE_MAX_DEPTH = 60      # 树的最大下潜深度，超过则用网络估值当叶子
+MCTS_MAX_NODES = 0            # 树展开节点数上限（0=不限，只用时间预算）
+# 树深：前多少层"建树复用"，超过就用一小段 playout 估值。
+# 关键作用不是省算力，而是**压住最大化偏差**——若每个节点都用 max_a Q(s,a)，
+# 值会被系统顶高（实测全部挤到 0.97~1.0），搜索失去分辨力。
+MCTS_TREE_PLAYOUT_DEPTH = 3
+
+# ---- 预算分配 ----
+# 'ucb'   : 先给每个候选动作补足 init_visits 次最低采样，之后按 UCB1
+#           （均值 + c·√(ln N / n)）把预算集中到"要么好、要么还没摸清"的分支。
+# 'prior' : 旧行为——按 softmax(网络值) 的比值铺开采样（网络看好的动作多采一些），
+#           没有"欠采样就补"的机制，容易把预算摊在大量无望动作上。
+MCTS_ALLOC = 'ucb'
+MCTS_UCB_C = 0.7               # UCB1 探索系数（与 gamev2.py 的 --c_ucb 一致）
+MCTS_UCB_INIT_VISITS = 3       # 每个候选动作的最低初始采样次数
+
+# ---- rollout 走子策略 ----
+# 'greedy': 双方都走网络最看好的动作（确定性 → 单次模拟方差小得多，
+#           是 §5.8 那个 86% 实现的关键之一）；
+# 'sample': 按 softmax(网络值) 采样（旧行为）。温度 1.0 下价值极差常只有 0.16 左右，
+#           采样几乎均匀，等于"近乎随机地走完一局"，估出来的胜率噪声很大。
+MCTS_ROLLOUT_POLICY = 'greedy'
+MCTS_ROLLOUT_TEMPERATURE = 1.0  # 仅 'sample' 策略使用
+MCTS_ROOT_TEMPERATURE = 1.0     # 仅 'prior' 分配使用
+MCTS_ROOT_BOOST = 4.0           # 仅 'prior' 分配使用
+
+# ---- rollout 的截断深度 ----
+# >0：每次模拟只走这么多步，然后用价值网络在当前局面上的估值代替"跑到底"；
+#     0：一直模拟到终局（旧行为）。
+# 截断的意义：终局的尾部噪声大、单次模拟也慢，截断后同样时间里能多跑好几倍模拟，
+# 且估值方差小得多（§5.8 的 86% 实现就是 8 步截断）。
+MCTS_LEAF_STEPS = 8
+
+# ---- 选优 ----
+# 'guarded_mean': 在采样量达标的动作里取"胜1/和0.5/负0"均值最高者，
+#                 且只有当它领先模型推荐超过 MCTS_OVERRIDE_Z 个标准误时才否决模型。
+# 'ratio'       : 旧行为——裸 win/visit 比值，几十个样本的噪声就能翻盘。
+MCTS_SELECT = 'guarded_mean'
+MCTS_MIN_VISITS = 8           # 参与选优所需的最低采样次数
+MCTS_OVERRIDE_Z = 1.0         # 否决模型推荐所需的标准误倍数（越大越保守）
+
 MCTS_FORCE_MODEL_STEPS = 1     # 对局前 N 步强制用模型 argmax，不跑 MCTS（开局局面信息少，模拟意义不大）
-MCTS_TOP_K = 3                  # 每个局面只保留神经网络预测权重最高的前 K 个合法动作（MCTS 搜索剪枝，0=不剪枝）
+MCTS_TOP_K = 5                  # 每个局面只保留网络值最高的前 K 个合法动作（0=不剪枝，用全部合法动作）
 MCTS_CACHE_MAX = 200000        # 单 worker 局面缓存上限，超过则清空
 MCTS_MAX_ROLLOUT_STEPS = 400  # 单局 rollout 最大步数，防止异常死循环
+
+# rollout 用哪个"世界"
+# -------------------
+# True  = 按 PIMC 纪律：每次模拟前先把**未翻开**格子的棋子身份重新打乱（多重集守恒），
+#         已翻开的棋盘/分数/和棋计数保持不变。于是"这个动作赢了多少次"是对**信念**的平均，
+#         与 gamev2.py 的口径一致，也是部署时真实可得的信息——诚实的强度口径。
+# False = 直接在**真实棋局**（含 true_board）上模拟，终局胜负按真实隐藏布置判定。
+#         等价于把每个候选动作拿到上帝视角下评估一遍：更强，但**作弊**，
+#         只能用于诊断对比（"知道隐藏信息能多赚多少"），不可当作可部署强度引用。
+MCTS_SAMPLE_WORLD = True
 
 
 def _load_scaled(filename, size):
@@ -310,6 +382,18 @@ class GuiDeepAgent:
             root_boost=MCTS_ROOT_BOOST,
             top_k=MCTS_TOP_K,
             cache_max=MCTS_CACHE_MAX,
+            sample_world=MCTS_SAMPLE_WORLD,
+            alloc=MCTS_ALLOC,
+            ucb_c=MCTS_UCB_C,
+            init_visits=MCTS_UCB_INIT_VISITS,
+            rollout_policy=MCTS_ROLLOUT_POLICY,
+            leaf_steps=MCTS_LEAF_STEPS,
+            search=MCTS_SEARCH,
+            c_puct=MCTS_TREE_C_PUCT,
+            prior_temp=MCTS_TREE_PRIOR_TEMP,
+            max_depth=MCTS_TREE_MAX_DEPTH,
+            max_nodes=MCTS_MAX_NODES,
+            playout_depth=MCTS_TREE_PLAYOUT_DEPTH,
             max_rollout_steps=MCTS_MAX_ROLLOUT_STEPS,
         )
 
@@ -320,7 +404,8 @@ class GuiDeepAgent:
         # 聚合统计：key 用动作元组，避免跨进程对象 identity 问题
         agg = {}
         for a in legal_actions:
-            agg[_action_key(a)] = {"visit": 0, "win": 0, "fail": 0, "draw": 0}
+            agg[_action_key(a)] = {"visit": 0, "win": 0, "fail": 0, "draw": 0,
+                                   "term": 0, "score": 0.0}
         total_hits = 0
         total_lookups = 0
 
@@ -344,6 +429,8 @@ class GuiDeepAgent:
                     agg[key]["win"] += int(s.get("win", 0))
                     agg[key]["fail"] += int(s.get("fail", 0))
                     agg[key]["draw"] += int(s.get("draw", 0))
+                    agg[key]["term"] += int(s.get("term", 0))
+                    agg[key]["score"] += float(s.get("score", 0.0))
 
         # ---- 打印 MCTS 统计 ----
         side = "红" if root_player == 0 else "黑"
@@ -351,13 +438,25 @@ class GuiDeepAgent:
         root_probs = _softmax(root_values, MCTS_ROOT_TEMPERATURE)
         model_best_idx = int(np.argmax(root_values))
         model_best = legal_actions[model_best_idx]
-        print(f"\n=== MCTS [{side}方] {len(legal_actions)} 个合法动作"
-              f"{f'，剪枝 top-{MCTS_TOP_K}' if MCTS_TOP_K > 0 else ''}, "
-              f"{MCTS_NUM_WORKERS} workers x {MCTS_THINK_TIME:.0f}s ===")
+        if MCTS_SEARCH == 'tree':
+            print(f"\n=== MCTS-树 [{side}方] {len(legal_actions)} 个合法动作, "
+                  f"{MCTS_NUM_WORKERS} 棵树 x {MCTS_THINK_TIME:.0f}s, "
+                  f"PUCT c={MCTS_TREE_C_PUCT}, 先验温度={MCTS_TREE_PRIOR_TEMP}, "
+                  f"选优 {MCTS_SELECT}, "
+                  f"{'PIMC 采样世界' if MCTS_SAMPLE_WORLD else '真实世界(上帝视角)'} ===")
+        else:
+            print(f"\n=== MCTS-扁平 [{side}方] {len(legal_actions)} 个合法动作"
+                  f"{f'，剪枝 top-{MCTS_TOP_K}' if MCTS_TOP_K > 0 else ''}, "
+                  f"{MCTS_NUM_WORKERS} workers x {MCTS_THINK_TIME:.0f}s, "
+                  f"分配 {MCTS_ALLOC}, rollout {MCTS_ROLLOUT_POLICY}"
+                  f"{f'(截断{MCTS_LEAF_STEPS}步)' if MCTS_LEAF_STEPS > 0 else '(跑到底)'}, "
+                  f"选优 {MCTS_SELECT}, "
+                  f"{'PIMC 采样世界' if MCTS_SAMPLE_WORLD else '真实世界(上帝视角)'} ===")
         total_visit = 0
         total_win = 0
         total_fail = 0
         total_draw = 0
+        total_term = 0
         for i, a in enumerate(legal_actions):
             key = _action_key(a)
             s = agg[key]
@@ -365,52 +464,117 @@ class GuiDeepAgent:
             total_win += s["win"]
             total_fail += s["fail"]
             total_draw += s["draw"]
-            wr = (s["win"] / s["visit"] * 100) if s["visit"] > 0 else 0.0
-            dr = (s["draw"] / s["visit"] * 100) if s["visit"] > 0 else 0.0
-            fr = (s["fail"] / s["visit"] * 100) if s["visit"] > 0 else 0.0
+            total_term += s["term"]
+            base = s["term"] if s["term"] > 0 else 1   # 终局口径；全截断时退化为 1
+            wr = (s["win"] / base * 100) if s["term"] > 0 else 0.0
+            dr = (s["draw"] / base * 100) if s["term"] > 0 else 0.0
+            fr = (s["fail"] / base * 100) if s["term"] > 0 else 0.0
+            avg = self._mean_score(agg, key)
             nn_v = root_values[i]
-            nn_p = root_probs[i] * 100
+            nn_p = root_probs[i] * 100   # 网络先验（仅 'prior' 分配用它铺采样）
             tag = ""
             if a is model_best:
                 tag = "  <-模型推荐"
             print(f"  {str(a):40s} nn={nn_v:+.3f}({nn_p:5.1f}%)  "
-                  f"visit={s['visit']:4d}  "
+                  f"visit={s['visit']:4d}  term={s['term']:4d}  "
                   f"win={s['win']:4d}({wr:5.1f}%)  "
                   f"fail={s['fail']:4d}({fr:5.1f}%)  "
-                  f"draw={s['draw']:4d}({dr:5.1f}%){tag}")
+                  f"draw={s['draw']:4d}({dr:5.1f}%)  "
+                  f"avg={avg:+.3f}{tag}")
         hit_rate = (total_hits / total_lookups * 100) if total_lookups > 0 else 0.0
+        term_rate = (total_term / total_visit * 100) if total_visit > 0 else 0.0
         print(f"  总模拟局数: {total_visit}  |  "
+              f"跑到终局: {total_term} ({term_rate:.1f}%)  |  "
               f"缓存命中: {total_hits}/{total_lookups} ({hit_rate:.1f}%)")
 
-        # 选 win/visit 最大；visit=0 的动作跳过
-        best_action = None
-        best_score = -1.0
-        for a in legal_actions:
-            key = _action_key(a)
-            v = agg[key]["visit"]
-            if v <= 0:
-                continue
-            score = agg[key]["win"] / v
-            if score > best_score:
-                best_score = score
-                best_action = a
+        # ---- 选优 ----
+        # 'ratio'       : 旧的裸 win/visit 比值（几十个样本的噪声就能翻盘）
+        # 'guarded_mean': 用"胜 1 / 和 0.5 / 负 0"的均值，并只在证据显著时才否决模型
+        if MCTS_SELECT == 'ratio':
+            best_action, best_score = None, -1.0
+            for a in legal_actions:
+                key = _action_key(a)
+                v = agg[key]["visit"]
+                if v <= 0:
+                    continue
+                wr = agg[key]["win"] / v
+                if wr > best_score:
+                    best_score, best_action = wr, a
+        else:
+            best_action = self._guarded_choice(legal_actions, agg, model_best)
 
-        # 决策标记 + 双方胜率
-        win_rate = (total_win / total_visit * 100) if total_visit > 0 else 0.0
-        fail_rate = (total_fail / total_visit * 100) if total_visit > 0 else 0.0
-        draw_rate = (total_draw / total_visit * 100) if total_visit > 0 else 0.0
-        print(f"  胜率: {side}方 {win_rate:.1f}%  |  {opp_side}方 {fail_rate:.1f}%  |  "
-              f"和棋 {draw_rate:.1f}%")
+        # 决策标记 + 得分 / 终局口径胜率
+        total_sc = sum(agg[_action_key(a)]["score"] for a in legal_actions)
+        mean_sc = (total_sc / total_visit) if total_visit > 0 else 0.0
+        if total_term > 0:
+            print(f"  终局口径(仅 {total_term} 次跑到终局): {side}方 "
+                  f"{total_win / total_term * 100:.1f}%  |  {opp_side}方 "
+                  f"{total_fail / total_term * 100:.1f}%  |  和棋 "
+                  f"{total_draw / total_term * 100:.1f}%")
+        print(f"  平均得分: {side}方 {mean_sc:.3f}"
+              f"（折算胜率 {mean_sc * 100:.1f}%；截断步数 {MCTS_LEAF_STEPS or '跑到底'}）")
 
         if best_action is None:
             print(f"  >> 无有效模拟，退化为模型推荐: {model_best}")
             return model_best
 
-        if best_action is model_best:
+        if _action_key(best_action) == _action_key(model_best):
             print(f"  >> 最终选择: {best_action}  (模型与模拟一致，推荐)")
         else:
             print(f"  >> 最终选择: {best_action}  (模拟推荐，模型原本推荐 {model_best})")
         return best_action
+
+    # ---- 选优规则 ----
+    @staticmethod
+    def _mean_score(agg, key):
+        """把"胜 1 / 和 0.5 / 负 0"折算成均值；没有样本时返回 0。
+
+        有截断时单次模拟给出的是连续得分（价值网络折算），统一记在 `score` 里，
+        所以这里优先用 `score / visit`；只有旧格式（无 `score`）才回退到胜率折算。
+        """
+        s = agg[key]
+        v = s["visit"]
+        if v <= 0:
+            return 0.0
+        if "score" in s:
+            return s["score"] / v
+        return (s["win"] + 0.5 * s["draw"]) / v
+
+    def _guarded_choice(self, legal_actions, agg, model_best):
+        """均值选优 + 显著性守卫。
+
+        旧规则（裸 win/visit 比值）在每步只有几十个样本时会把噪声当信号：实测约 2/3 的
+        决策去否决模型自己的 argmax，而依据的采样量只有 60 次左右（胜率标准误 ≈ ±6pp）。
+
+        新规则分两步：
+        1. 在采样量达到 `MCTS_MIN_VISITS` 的动作里取均值最高者；
+        2. **只有当它相对模型推荐动作的优势超过 `MCTS_OVERRIDE_Z` 个标准误时**才采纳，
+           否则保留模型推荐。这样"证据不足"时默认听模型的（相当于以模型为先验）。
+        """
+        key_m = _action_key(model_best)
+        cands = [a for a in legal_actions if agg[_action_key(a)]["visit"] >= MCTS_MIN_VISITS]
+        if not cands:  # 预算太小，一个动作都没达到门槛
+            cands = [a for a in legal_actions if agg[_action_key(a)]["visit"] > 0]
+        if not cands:
+            return model_best
+
+        cand = max(cands, key=lambda a: self._mean_score(agg, _action_key(a)))
+        key_c = _action_key(cand)
+        if key_c == key_m:
+            return model_best
+
+        n_c, m_c = agg[key_c]["visit"], self._mean_score(agg, key_c)
+        n_m, m_m = agg[key_m]["visit"], self._mean_score(agg, key_m)
+        if n_m <= 0:  # 模型推荐动作一次都没被采到（剪枝外），直接采纳搜索结论
+            return cand
+        se_c = math.sqrt(max(m_c * (1.0 - m_c), 1e-6) / n_c)
+        se_m = math.sqrt(max(m_m * (1.0 - m_m), 1e-6) / n_m)
+        margin = MCTS_OVERRIDE_Z * math.sqrt(se_c * se_c + se_m * se_m)
+        if m_c - m_m > margin:
+            print(f"  >> 否决模型推荐: {cand} 均值 {m_c:.3f}(n={n_c}) 显著高于 "
+                  f"模型推荐 {model_best} 的 {m_m:.3f}(n={n_m})，阈值 {margin:.3f}")
+            return cand
+        return model_best
 
 
 def get_agent(model_path, cache):
@@ -442,6 +606,267 @@ def _softmax(x, temperature=1.0):
     return e / s
 
 
+def _sample_world(root_env, sample=True):
+    """从根局面复制出一个"模拟用的世界"。
+
+    `sample=True`（默认）按 PIMC 纪律：只打乱**未翻开**格子背后的棋子身份
+    （多重集守恒，已翻开的棋盘/分数/和棋计数保持不变）。由于网络特征只依赖公开信息，
+    策略对同一多重集的不同排列不敏感，变的只是"翻棋时揭出什么"——正是需要平均掉的部分。
+
+    `sample=False` 直接用真实棋盘，终局胜负按真实隐藏布置判定。更快更强，但属于
+    上帝视角（作弊），仅供诊断对比。
+    """
+    world = root_env.deepcopy()
+    if not sample:
+        return world
+    poss = sorted(world.unflipped_positions)
+    if len(poss) > 1:
+        pieces = [world.true_board[r][c] for r, c in poss]
+        np.random.shuffle(pieces)
+        for (r, c), piece in zip(poss, pieces):
+            world.true_board[r][c] = piece
+    return world
+
+
+def _terminal_score(env, root_player):
+    """终局得分（根玩家视角）：胜 1 / 和 0.5 / 负 0。"""
+    if env.winner < 0:
+        return 0.5
+    return 1.0 if env.winner == root_player else 0.0
+
+
+def _state_key(env, hist):
+    """局面缓存键：公开棋盘 + 行动方 + 分数 + 和棋计数 + 未翻开集合 + 最近 10 步。"""
+    board_t = tuple(tuple(int(p) for p in row) for row in env.board)
+    unflipped_t = frozenset((int(r), int(c)) for (r, c) in env.unflipped_positions)
+    hist_t = tuple(_action_key(a) for a in hist[-10:])
+    return (board_t, int(env.current_player), int(env.red_score),
+            int(env.black_score), int(env.peace_steps), unflipped_t, hist_t)
+
+
+class _MctsNode:
+    """树节点。`w/n` 是**根玩家视角**的累计得分与访问次数。"""
+
+    __slots__ = ('env', 'hist', 'n', 'w', 'legal', 'priors', 'q0', 'children',
+                 'expanded', 'terminal', 'tscore', 'max_q')
+
+    def __init__(self, env, hist):
+        self.env = env
+        self.hist = hist
+        self.n = 0
+        self.w = 0.0
+        self.legal = None
+        self.priors = None
+        self.q0 = None
+        self.children = {}
+        self.expanded = False
+        self.terminal = bool(env.done)
+        self.tscore = None
+        self.max_q = 0.5
+
+
+class TreeSearch:
+    """树式 MCTS（PUCT + 价值网络估值，无 playout）。
+
+    与扁平 UCB 版的关键区别：**模拟结果留在树上**。同一个局面被再次走到时，
+    直接复用已有的访问次数与均值，而不是从头再模拟一遍；因此算力花在
+    "把树往深处推" 而不是"重复评估已评估过的局面"。
+
+    每次 `search()` 会先从信念采样一个与公开观测一致的世界（PIMC），
+    整棵树都建在这个世界里；多个 worker 各建一棵、最后在根动作上合并，
+    等价于"根并行的 PIMC-MCTS"。
+    """
+
+    def __init__(self, net, device='cpu', c_puct=None, prior_temp=None,
+                 sample_world=None, max_depth=None, cache_max=None,
+                 playout_depth=None):
+        self.net = net
+        self.device = torch.device(device)
+        self.c_puct = MCTS_TREE_C_PUCT if c_puct is None else c_puct
+        self.prior_temp = MCTS_TREE_PRIOR_TEMP if prior_temp is None else prior_temp
+        self.sample_world = MCTS_SAMPLE_WORLD if sample_world is None else sample_world
+        self.max_depth = MCTS_TREE_MAX_DEPTH if max_depth is None else max_depth
+        self.cache_max = MCTS_CACHE_MAX if cache_max is None else cache_max
+        self.playout_depth = (MCTS_TREE_PLAYOUT_DEPTH if playout_depth is None
+                              else int(playout_depth))
+        self.top_k = MCTS_TOP_K
+        self._cache = {}
+        self.expansions = 0      # 统计：累计展开次数
+
+    # ---- 网络估值（带局面缓存）----
+    def values(self, env, hist):
+        legal = env.get_legal_actions()
+        if not legal:
+            return legal, np.zeros(0, dtype=np.float32)
+        key = _state_key(env, hist)
+        cached = self._cache.get(key)
+        if cached is not None and len(cached) == len(legal):
+            return legal, cached
+        n = len(legal)
+        infoset = InfoSet(player=env.current_player, game_env=env,
+                          action_history=hist, perfect_info=False)
+        x = torch.from_numpy(infoset.x_no_action).to(self.device).unsqueeze(0).expand(n, -1).contiguous()
+        z = torch.from_numpy(infoset.z).to(self.device).unsqueeze(0).expand(n, -1, -1).contiguous()
+        a = torch.from_numpy(infoset.action_encodings).to(self.device)
+        with torch.no_grad():
+            vals = self.net(x, a, z, return_value=True)["value"].cpu().numpy()
+        if len(self._cache) >= self.cache_max:
+            self._cache.clear()
+        self._cache[key] = vals
+        return legal, vals
+
+    # ---- 展开 ----
+    def _expand(self, node, root_player):
+        legal, vals = self.values(node.env, node.hist)
+        node.expanded = True
+        self.expansions += 1
+        # 树也做候选剪枝（broad > deep）——扁平模式赢就赢在这份"广度"
+        if self.top_k and 0 < self.top_k < len(legal):
+            order = np.argsort(vals)[::-1][:self.top_k]
+            legal = [legal[i] for i in order]
+            vals = vals[order]
+        if not legal:
+            node.terminal = True
+            node.tscore = 0.5
+            node.max_q = 0.5
+            return 0.5
+        node.legal = legal
+        spread = float(vals.max() - vals.min())
+        # 温度按价值极差归一化：局面里动作价值差得越大，先验越尖；
+        # 差得越小（势均力敌）则先验越平，把预算留给探索。
+        node.priors = _softmax(vals, self.prior_temp * max(spread, 1e-3))
+        # 网络值是从"当前行动方"视角给出的；换算到根玩家视角再映射到 [0,1]
+        v = -vals if node.env.current_player != root_player else vals
+        node.q0 = np.clip((v + 1.0) / 2.0, 0.0, 1.0)
+        node.max_q = float(node.q0.max())
+        return node.max_q
+
+    # ---- PUCT 选择 ----
+    def _select(self, node, root_player):
+        sq = math.sqrt(max(1, node.n))
+        best_u, best_a, best_ch = -1e18, None, None
+        for i, a in enumerate(node.legal):
+            key = _action_key(a)
+            ch = node.children.get(key)
+            if ch is None:
+                q, n_ch = node.q0[i], 0
+            else:
+                q = ch.w / ch.n if ch.n else node.q0[i]
+                n_ch = ch.n
+            u = q + self.c_puct * node.priors[i] * sq / (1.0 + n_ch)
+            if u > best_u:
+                best_u, best_a, best_ch = u, a, ch
+        if best_ch is None:                       # 懒创建子节点：只对真正要访问的分支深拷贝
+            env2 = node.env.deepcopy()
+            env2.step(best_a)
+            best_ch = _MctsNode(env2, node.hist + [best_a])
+            if env2.done:
+                best_ch.tscore = _terminal_score(env2, root_player)
+                best_ch.max_q = best_ch.tscore
+            node.children[_action_key(best_a)] = best_ch
+        return best_a, best_ch
+
+    # ---- 叶子 playout：避免"max_a V(s,a)"的最大化偏差 ----
+    def playout(self, env, hist, root_player, leaf_steps=None, policy=None,
+                temperature=None, max_steps=None):
+        """从 `env` 出发走一小段（默认贪心）后用价值网络估值。
+
+        为什么树里还要 playout：本网络给的是 Q(s,a)（"走这步值多少"）。若每个树
+        节点都用 `max_a Q(s,a)` 当节点值，就会像 DQN 的最大化那样把估值系统性顶高
+        ——实测所有根动作的 Q 都挤在 0.97~1.0，搜索彻底失去分辨力。
+        改成"前几层建树复用、叶子走一段再估"，备份下去的就是真实对局得分的平均。
+        """
+        leaf_steps = MCTS_LEAF_STEPS if leaf_steps is None else leaf_steps
+        policy = MCTS_ROLLOUT_POLICY if policy is None else policy
+        temperature = MCTS_ROLLOUT_TEMPERATURE if temperature is None else temperature
+        max_steps = MCTS_MAX_ROLLOUT_STEPS if max_steps is None else max_steps
+        # 每次 playout 都重新采样一个与公开观测一致的世界（PIMC）。
+        # 若只沿用建树时的那个世界，同一子节点的每次访问都会走出**同一条**
+        # 确定性贪心线路，重复采样毫无信息增益（实测 4871 次备份其实只有几百个独立样本）。
+        e = _sample_world(env, self.sample_world)
+        h = list(hist)
+        steps = 0
+        while not e.done and steps < max_steps:
+            if leaf_steps and steps >= leaf_steps:
+                break
+            legal, vals = self.values(e, h)
+            if not legal:
+                break
+            if len(legal) == 1:
+                a = legal[0]
+            elif policy == 'greedy':
+                a = legal[int(np.argmax(vals))]
+            else:
+                p = _softmax(vals, temperature)
+                a = legal[int(np.random.choice(len(legal), p=p))]
+            e.step(a)
+            h.append(a)
+            steps += 1
+        if e.done:
+            return _terminal_score(e, root_player)
+        legal, vals = self.values(e, h)
+        if not legal:
+            return 0.5
+        v = float(np.max(vals))
+        if e.current_player != root_player:
+            v = -v
+        return min(1.0, max(0.0, (v + 1.0) / 2.0))
+
+    # ---- 一次完整搜索 ----
+    def search(self, env, history, root_player=None, time_budget=1.0,
+               max_nodes=0, seed=0):
+        """返回 (stats, info)。
+
+        `stats`: {动作键: {visit, score, win, fail, draw, term}}，score 为根视角累计得分。
+        `info` : {'root_legal': [...], 'expansions': n, 'root_q': {键: 均值}}
+        """
+        root_player = env.current_player if root_player is None else int(root_player)
+        rng_holder = None
+        root_env = _sample_world(env, self.sample_world)
+        root = _MctsNode(root_env, list(history))
+        deadline = time.time() + float(time_budget)
+        n_exp = 0
+        while True:
+            if time_budget and time_budget > 0 and time.time() >= deadline:
+                break
+            if max_nodes and max_nodes > 0 and n_exp >= max_nodes:
+                break
+            node, path_nodes, depth = root, [], 0
+            while True:
+                path_nodes.append(node)
+                if node.terminal:
+                    score = node.tscore if node.tscore is not None else _terminal_score(node.env, root_player)
+                    break
+                if depth >= self.playout_depth or depth >= self.max_depth:
+                    # 到达树深上限：走一小段 playout 再估值（避免最大化偏差）
+                    score = self.playout(node.env, node.hist, root_player)
+                    break
+                if not node.expanded:
+                    score = self._expand(node, root_player)
+                    n_exp += 1
+                    break
+                a, child = self._select(node, root_player)
+                node = child
+                depth += 1
+            # 备份：从根到叶子**每一个**节点都要计数（叶子自己也算一次访问）
+            for nd in path_nodes:
+                nd.n += 1
+                nd.w += score
+        # 用子节点统计汇总根动作（比在循环里记账更省）
+        stats = {}
+        for a in (root.legal or []):
+            key = _action_key(a)
+            ch = root.children.get(key)
+            stats[key] = dict(visit=(ch.n if ch else 0),
+                              score=(ch.w if ch else 0.0),
+                              win=0, fail=0, draw=0,
+                              term=(ch.n if (ch and ch.terminal) else 0))
+        info = dict(root_legal=root.legal or [], expansions=n_exp,
+                    root_q={k: (v['score'] / v['visit'] if v['visit'] else 0.0)
+                            for k, v in stats.items()})
+        return stats, info
+
+
 def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
     """常驻 MCTS worker 子进程。
 
@@ -451,7 +876,8 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
     - 收到 None 任务时退出。
 
     任务 dict 字段：root_env_state / root_history / root_player /
-    think_time / temperature / root_temperature / cache_max / max_rollout_steps。
+    think_time / temperature / root_temperature / root_boost / top_k /
+    cache_max / sample_world / max_rollout_steps。
     """
     # 子进程内重新 import，避免依赖 spawn 继承的模块状态
     import numpy as _np
@@ -461,6 +887,9 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
 
     _np.random.seed(seed)
     _torch.manual_seed(seed)
+    # 每个 worker 只用一个 CPU 线程：默认会按核数开线程，6~12 个 worker 就是上百线程，
+    # 在 16 核机上会互相抢占到整机卡死（arena_v3 / GUI 都必须保留这一行）。
+    _torch.set_num_threads(1)
 
     device = _torch.device("cpu")
     model = _FlipZeroModel()
@@ -475,6 +904,7 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
     cache = {}
     cache_hits = [0]
     cache_lookups = [0]
+    _tree_searcher = [None]        # 树搜索实例跨任务复用，让局面缓存吃满
 
     def _cache_key(env, hist):
         board_t = tuple(tuple(int(p) for p in row) for row in env.board)
@@ -529,11 +959,36 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
             root_boost = task.get("root_boost", 1.0)
             top_k = task.get("top_k", 0)
             cache_max = task["cache_max"]
+            sample_world = task.get("sample_world", MCTS_SAMPLE_WORLD)
+            alloc = task.get("alloc", MCTS_ALLOC)
+            ucb_c = float(task.get("ucb_c", MCTS_UCB_C))
+            init_visits = int(task.get("init_visits", MCTS_UCB_INIT_VISITS))
+            rollout_policy = task.get("rollout_policy", MCTS_ROLLOUT_POLICY)
+            leaf_steps = int(task.get("leaf_steps", MCTS_LEAF_STEPS))
             max_rollout_steps = task["max_rollout_steps"]
+            search_mode = task.get("search", MCTS_SEARCH)
 
             # 每次任务重置缓存命中计数（cache dict 本身跨任务保留）
             cache_hits[0] = 0
             cache_lookups[0] = 0
+
+            if search_mode == 'tree':
+                # 树式 MCTS：一棵树建在一个采样世界里；前若干层建树复用，
+                # 叶子走一小段 playout 估值。实例跨任务复用（缓存只看公开信息）。
+                searcher = _tree_searcher[0]
+                if searcher is None:
+                    searcher = TreeSearch(model, 'cpu', cache_max=cache_max)
+                    _tree_searcher[0] = searcher
+                searcher.c_puct = float(task.get("c_puct", MCTS_TREE_C_PUCT))
+                searcher.prior_temp = float(task.get("prior_temp", MCTS_TREE_PRIOR_TEMP))
+                searcher.sample_world = sample_world
+                searcher.max_depth = int(task.get("max_depth", MCTS_TREE_MAX_DEPTH))
+                searcher.playout_depth = int(task.get("playout_depth", MCTS_TREE_PLAYOUT_DEPTH))
+                stats, info = searcher.search(
+                    root_env, history, root_player,
+                    time_budget=think_time, max_nodes=int(task.get("max_nodes", 0)))
+                result_queue.put((stats, searcher.expansions, len(searcher._cache)))
+                continue
 
             root_legal, root_vals = _policy_values(root_env, history, cache_max, top_k)
             if not root_legal:
@@ -550,27 +1005,52 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
 
             stats = {}
             for a in root_legal:
-                stats[_action_key(a)] = {"visit": 0, "win": 0, "fail": 0, "draw": 0}
+                stats[_action_key(a)] = {"visit": 0, "win": 0, "fail": 0, "draw": 0,
+                                         "term": 0, "score": 0.0}
+            n_total = 0
+            n_init = max(1, init_visits) * len(root_legal)
 
             deadline = time.time() + think_time
             while time.time() < deadline:
+                # ---- 根动作选择 ----
                 if len(root_legal) == 1:
                     a0 = root_legal[0]
+                elif alloc == 'prior' or n_total < n_init:
+                    # 'prior'：按 softmax(网络值) 铺开；'ucb' 的初始阶段：轮转补齐最低采样
+                    if alloc == 'prior':
+                        a0 = root_legal[int(_np.random.choice(len(root_legal), p=root_probs))]
+                    else:
+                        a0 = root_legal[n_total % len(root_legal)]
                 else:
-                    a0 = root_legal[int(_np.random.choice(len(root_legal), p=root_probs))]
+                    # UCB1：均值 + c·√(ln N / n)，让预算在"已知好"与"还没摸清"之间平衡
+                    ln_n = math.log(max(2, n_total))
+                    best_u, a0 = -1e18, root_legal[0]
+                    for cand in root_legal:
+                        s = stats[_action_key(cand)]
+                        v = s["visit"]
+                        mean = s["score"] / v if v else 0.0
+                        u = 1e18 if v == 0 else mean + ucb_c * math.sqrt(ln_n / v)
+                        if u > best_u:
+                            best_u, a0 = u, cand
 
-                sim_env = root_env.deepcopy()
+                # 每次 rollout 独立采样一个与公开观测一致的世界（PIMC）；
+                # sample_world=False 时退化为在真实棋盘上模拟（上帝视角，仅诊断用）
+                sim_env = _sample_world(root_env, sample_world)
                 sim_hist = list(history)
                 sim_hist.append(a0)
                 sim_env.step(a0)
 
                 steps = 0
                 while not sim_env.done and steps < max_rollout_steps:
+                    if leaf_steps > 0 and steps >= leaf_steps:
+                        break        # 到达截断深度，改用价值网络估值（见下）
                     legals, vals = _policy_values(sim_env, sim_hist, cache_max, top_k)
                     if not legals:
                         break
                     if len(legals) == 1:
                         a_next = legals[0]
+                    elif rollout_policy == 'greedy':
+                        a_next = legals[int(_np.argmax(vals))]
                     else:
                         probs = _softmax(vals, temperature)
                         a_next = legals[int(_np.random.choice(len(legals), p=probs))]
@@ -580,14 +1060,35 @@ def _mcts_worker_loop(model_path, task_queue, result_queue, seed):
 
                 key0 = _action_key(a0)
                 if key0 not in stats:
-                    stats[key0] = {"visit": 0, "win": 0, "fail": 0, "draw": 0}
-                stats[key0]["visit"] += 1
-                if sim_env.winner == root_player:
-                    stats[key0]["win"] += 1
-                elif sim_env.winner == -2:
-                    stats[key0]["draw"] += 1
+                    stats[key0] = {"visit": 0, "win": 0, "fail": 0, "draw": 0,
+                                   "term": 0, "score": 0.0}
+                st0 = stats[key0]
+                st0["visit"] += 1
+                n_total += 1
+                if sim_env.done:
+                    st0["term"] += 1
+                    if sim_env.winner == root_player:
+                        st0["win"] += 1
+                        score0 = 1.0
+                    elif sim_env.winner == -2:
+                        st0["draw"] += 1
+                        score0 = 0.5
+                    else:
+                        st0["fail"] += 1
+                        score0 = 0.0
                 else:
-                    stats[key0]["fail"] += 1
+                    # 截断点估值：对"当前行动方"的所有候选动作取网络值最大，
+                    # 若当前行动方不是根玩家则取反（与 gamev2._leaf_value 同口径），
+                    # 再折算成 [0,1] 的得分。
+                    leaf_legal, leaf_vals = _policy_values(sim_env, sim_hist, cache_max, top_k)
+                    if leaf_legal:
+                        v_leaf = float(_np.max(leaf_vals))
+                        if sim_env.current_player != root_player:
+                            v_leaf = -v_leaf
+                        score0 = min(1.0, max(0.0, (v_leaf + 1.0) / 2.0))
+                    else:
+                        score0 = 0.5
+                st0["score"] += score0
 
             result_queue.put((stats, cache_hits[0], cache_lookups[0]))
         except Exception:
